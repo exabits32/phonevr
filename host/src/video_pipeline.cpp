@@ -36,6 +36,8 @@ cbuffer P : register(b0) {
     float2 scale;      // (2*aspect, 2)
     float4 bounds;     // source texture valid region: uMin, vMin, uMax, vMax
     float  k1; float k2; float chroma; float encode;
+    float  opaque;     // 1 = bottom (scene) layer: ignore alpha; 0 = overlay layer: keep alpha
+    float3 pad;
 };
 Texture2D tex : register(t0);
 SamplerState smp : register(s0);
@@ -62,16 +64,20 @@ float4 PS(VSOut i) : SV_Target {
     float r2 = dot(v, v);
     float f = 1.0 + k1 * r2 + k2 * r2 * r2;
     float3 rgb = float3(0, 0, 0);
+    float a = 0.0;  // outside the texture: black for the scene, transparent for overlays
     [unroll] for (int ch = 0; ch < 3; ch++) {
         float cf = f * (1.0 + chroma * (ch - 1));   // R: -chroma, G: 0, B: +chroma
         float2 uv = 0.5 + (v * cf) / scale;
         if (all(uv >= 0.0) && all(uv <= 1.0)) {
             float2 tuv = lerp(bounds.xy, bounds.zw, uv);
-            rgb[ch] = tex.SampleLevel(smp, tuv, 0)[ch];
+            float4 s = tex.SampleLevel(smp, tuv, 0);
+            rgb[ch] = s[ch];
+            if (ch == 1) a = s.a;
         }
     }
     if (encode > 0.5) rgb = srgbEncode(rgb);
-    return float4(rgb, 1.0);
+    // The scene's alpha is meaningless (often 0), so the bottom layer is always opaque.
+    return float4(rgb, opaque > 0.5 ? 1.0 : saturate(a));
 }
 )";
 
@@ -80,8 +86,9 @@ struct CBData {
     float scale[2];
     float bounds[4];
     float k1, k2, chroma, encode;
+    float opaque, pad[3];
 };
-static_assert(sizeof(CBData) == 48, "cbuffer layout");
+static_assert(sizeof(CBData) == 64, "cbuffer layout");
 
 DXGI_FORMAT SrvFormatFor(DXGI_FORMAT f, bool& encodeSrgb) {
     encodeSrgb = false;
@@ -496,6 +503,20 @@ bool VideoPipeline::CreateRenderResources() {
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(dev_->CreateBuffer(&bd, nullptr, &cbuf_))) return false;
 
+    // Overlay layers (HUD, fade panel, dashboard...) are drawn over the scene with
+    // straight alpha; the destination alpha stays 1.
+    D3D11_BLEND_DESC bld = {};
+    auto& rt = bld.RenderTarget[0];
+    rt.BlendEnable = TRUE;
+    rt.SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    rt.DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    rt.BlendOp = D3D11_BLEND_OP_ADD;
+    rt.SrcBlendAlpha = D3D11_BLEND_ZERO;
+    rt.DestBlendAlpha = D3D11_BLEND_ONE;
+    rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(dev_->CreateBlendState(&bld, &blendOver_))) return false;
+
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = settings_.streamWidth;
     td.Height = settings_.streamHeight;
@@ -586,7 +607,7 @@ void VideoPipeline::Shutdown() {
     }
     for (auto& s : slots_) { s.view.Reset(); s.tex.Reset(); }
     vpIn_.Reset(); vp_.Reset(); vpEnum_.Reset();
-    rgbRtv_.Reset(); rgbTex_.Reset(); cbuf_.Reset(); sampler_.Reset(); ps_.Reset(); vs_.Reset();
+    rgbRtv_.Reset(); rgbTex_.Reset(); blendOver_.Reset(); cbuf_.Reset(); sampler_.Reset(); ps_.Reset(); vs_.Reset();
     vctx_.Reset(); vdev_.Reset(); ctx_.Reset(); dev1_.Reset(); dev_.Reset();
 }
 
@@ -666,17 +687,22 @@ void VideoPipeline::NextSwapTextureSetIndex(const uint64_t handles[2], uint32_t 
 }
 
 void VideoPipeline::SubmitLayer(const uint64_t handles[2], const float bounds[2][4]) {
+    // Called once per layer, bottom to top, before each Present. Games with overlays
+    // (DiRT Rally 2.0's HUD / fade panel, the SteamVR dashboard) submit several.
     std::lock_guard<std::mutex> lk(texMutex_);
+    if (frameLayers_.size() >= 16) return;  // sanity cap
+    Layer l;
     for (int i = 0; i < 2; i++) {
-        layerHandle_[i] = handles[i];
-        memcpy(layerBounds_[i], bounds[i], sizeof(float) * 4);
+        l.handles[i] = handles[i];
+        memcpy(l.bounds[i], bounds[i], sizeof(float) * 4);
     }
+    frameLayers_.push_back(l);
 }
 
 // ---------------------------------------------------------------------------
 // per-frame work
 // ---------------------------------------------------------------------------
-void VideoPipeline::DrawEye(int eye, const SwapTex* src, const float bounds[4]) {
+void VideoPipeline::DrawEye(int eye, const SwapTex* src, const float bounds[4], bool opaque) {
     if (!src || !src->srv) return;
     const float eyeW = settings_.streamWidth * 0.5f;
     const float H = (float)settings_.streamHeight;
@@ -692,6 +718,7 @@ void VideoPipeline::DrawEye(int eye, const SwapTex* src, const float bounds[4]) 
     cb.k2 = settings_.lensK2;
     cb.chroma = settings_.chromatic;
     cb.encode = src->encodeSrgb ? 1.f : 0.f;
+    cb.opaque = opaque ? 1.f : 0.f;
 
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(ctx_->Map(cbuf_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
@@ -709,17 +736,30 @@ void VideoPipeline::DrawEye(int eye, const SwapTex* src, const float bounds[4]) 
 
 void VideoPipeline::Present(uint64_t syncHandle) {
     if (!dev_) return;
-    SwapTex eyes[2];
-    float bounds[2][4];
+    struct DrawLayer {
+        SwapTex eyes[2];
+        float bounds[2][4];
+    };
+    std::vector<DrawLayer> layers;
     ComPtr<ID3D11Texture2D> sync;
-    bool haveEyes = true;
+    size_t submitted = 0;
     {
         std::lock_guard<std::mutex> lk(texMutex_);
-        for (int i = 0; i < 2; i++) {
-            auto it = swapTex_.find(layerHandle_[i]);
-            if (it == swapTex_.end()) { haveEyes = false; break; }
-            eyes[i] = it->second;
-            memcpy(bounds[i], layerBounds_[i], sizeof(bounds[i]));
+        if (!frameLayers_.empty()) {
+            lastLayers_.swap(frameLayers_);
+            frameLayers_.clear();
+        }
+        submitted = lastLayers_.size();
+        for (const Layer& l : lastLayers_) {
+            DrawLayer d;
+            bool ok = true;
+            for (int i = 0; i < 2 && ok; i++) {
+                auto it = swapTex_.find(l.handles[i]);
+                if (it == swapTex_.end()) { ok = false; break; }
+                d.eyes[i] = it->second;
+                memcpy(d.bounds[i], l.bounds[i], sizeof(d.bounds[i]));
+            }
+            if (ok) layers.push_back(std::move(d));  // skip layers whose textures are gone
         }
         if (syncHandle) {
             auto it = syncTex_.find(syncHandle);
@@ -735,7 +775,11 @@ void VideoPipeline::Present(uint64_t syncHandle) {
             }
         }
     }
-    if (!haveEyes) return;
+    if (submitted != loggedLayerCount_) {
+        Log("PhoneVR: compositor now submits %zu layer(s) per frame", submitted);
+        loggedLayerCount_ = submitted;
+    }
+    if (layers.empty()) return;
 
     ComPtr<IDXGIKeyedMutex> km;
     if (sync) sync.As(&km);
@@ -754,7 +798,13 @@ void VideoPipeline::Present(uint64_t syncHandle) {
     ctx_->PSSetConstantBuffers(0, 1, &cb);
     ID3D11SamplerState* sp = sampler_.Get();
     ctx_->PSSetSamplers(0, 1, &sp);
-    for (int e = 0; e < 2; e++) DrawEye(e, &eyes[e], bounds[e]);
+    // Bottom layer (the game's scene) opaque, every further layer alpha-blended on top.
+    for (size_t li = 0; li < layers.size(); li++) {
+        const bool opaque = li == 0;
+        ctx_->OMSetBlendState(opaque ? nullptr : blendOver_.Get(), nullptr, 0xffffffff);
+        for (int e = 0; e < 2; e++) DrawEye(e, &layers[li].eyes[e], layers[li].bounds[e], opaque);
+    }
+    ctx_->OMSetBlendState(nullptr, nullptr, 0xffffffff);
     ctx_->OMSetRenderTargets(0, nullptr, nullptr);
 
     // --- pick a free NV12 slot and convert ---

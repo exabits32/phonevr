@@ -75,7 +75,13 @@ private:
     bool CreateRenderResources();
     bool CreateConverter();
     void EncodeLoop();
-    void DrawEye(int eye, const SwapTex* src, const float bounds[4]);
+    // One compositor layer (scene, overlay, ...) as handed over by SubmitLayer.
+    struct Layer {
+        uint64_t handles[2] = {};
+        float bounds[2][4] = {};
+    };
+
+    void DrawEye(int eye, const SwapTex* src, const float bounds[4], bool opaque);
 
     Settings settings_;
     uint64_t luid_ = 0;
@@ -92,6 +98,7 @@ private:
     ComPtr<ID3D11PixelShader> ps_;
     ComPtr<ID3D11SamplerState> sampler_;
     ComPtr<ID3D11Buffer> cbuf_;
+    ComPtr<ID3D11BlendState> blendOver_;  // alpha-blends overlay layers onto the scene
     ComPtr<ID3D11Texture2D> rgbTex_;
     ComPtr<ID3D11RenderTargetView> rgbRtv_;
 
@@ -106,8 +113,10 @@ private:
     std::mutex texMutex_;
     std::map<uint64_t, SwapTex> swapTex_;
     std::map<uint64_t, ComPtr<ID3D11Texture2D>> syncTex_;
-    uint64_t layerHandle_[2] = {};
-    float layerBounds_[2][4] = {};
+    // The compositor calls SubmitLayer once per layer (bottom to top), then Present.
+    std::vector<Layer> frameLayers_;  // layers submitted since the last Present
+    std::vector<Layer> lastLayers_;   // reused if a Present arrives with no new layers
+    size_t loggedLayerCount_ = 0;
 
     // encoder hand-off
     std::unique_ptr<H264Encoder> enc_;
